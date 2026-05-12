@@ -348,6 +348,7 @@ class FlexibleBloodFlowDataset(Dataset):
 
 def sequence_sparse_collate(batch):
     seq_len = len(batch[0][0])
+    has_metadata = len(batch[0]) > 5
     batched_seq_data = []
 
     for t in range(seq_len):
@@ -361,4 +362,7 @@ def sequence_sparse_collate(batch):
     env_maps = torch.stack([sample[3] for sample in batch], dim=0)
     source_ids = torch.tensor([sample[4] for sample in batch], dtype=torch.long)
 
+    if has_metadata:
+        metadata = [sample[5] for sample in batch]
+        return batched_seq_data, labels, d_values, env_maps, source_ids, metadata
     return batched_seq_data, labels, d_values, env_maps, source_ids

@@ -124,8 +124,21 @@ def compute_mae_by_velocity(v_true, v_pred):
     v_pred = np.asarray(v_pred, dtype=np.float64)
     for velocity in sorted(set(v_true.tolist())):
         mask = v_true == velocity
+        pred_values = v_pred[mask]
         mae, rmse, mape = compute_scalar_metrics(v_true[mask], v_pred[mask])
-        rows.append({"velocity": velocity, "samples": int(mask.sum()), "mae": mae, "rmse": rmse, "mape": mape})
+        pred_mean = float(pred_values.mean()) if pred_values.size else float("nan")
+        rows.append(
+            {
+                "velocity": velocity,
+                "samples": int(mask.sum()),
+                "pred_mean": pred_mean,
+                "pred_std": float(pred_values.std()) if pred_values.size else float("nan"),
+                "bias": pred_mean - float(velocity),
+                "mae": mae,
+                "rmse": rmse,
+                "mape": mape,
+            }
+        )
     return rows
 
 
@@ -258,8 +271,14 @@ def write_evaluation_report(report_path, run_info, eval_record):
         "",
         "## Run Config",
         "",
-        f"- total_steps: `{run_info['total_steps']}`",
-        f"- block_size: `{run_info['block_size']}`",
+        f"- window_ms: `{run_info['window_ms']}`",
+        f"- base_dt_us: `{run_info['base_dt_us']}`",
+        f"- base_total_steps: `{run_info['base_total_steps']}`",
+        f"- base_block_size: `{run_info['base_block_size']}`",
+        f"- snn_bin_size: `{run_info['snn_bin_size']}`",
+        f"- snn_step_us: `{run_info['snn_step_us']}`",
+        f"- snn_steps: `{run_info['snn_steps']}`",
+        f"- snn_input_scale_mode: `{run_info['snn_input_scale_mode']}`",
         f"- batch_size: `{run_info['batch_size']}`",
         f"- dt_us: `{run_info['dt_us']}`",
         f"- spatial_shape: `{run_info['spatial_shape']}`",
@@ -286,11 +305,11 @@ def write_evaluation_report(report_path, run_info, eval_record):
         format_markdown_table("Eval Samples Per Velocity", test_ds.velocity_sample_counts, "Velocity"),
         "## Evaluation Metrics",
         "",
-        "| Eval Batches | Eval Samples | MAE | RMSE | MAPE | Pred Std | Pred Range | Pred/Label Pearson | Rank Acc | Tau Pred MAE | Tau Pred Std | Tau Pred Range | Tau Sample Range | Log Tau Range |",
-        "| ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- | --- | --- |",
+        "| Eval Batches | Eval Samples | Final MAE | Final RMSE | Final MAPE | Final Pred Std | Final Pred Range | Final Pred/Label Pearson | Final Rank Acc | Clipped MAE | Clipped RMSE | Clipped MAPE | Clipped Pred Range | Aux V MAE | Aux V Std | Aux V Range | Tau Sample Range | Log Tau Range |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- | --- | --- |",
     ]
     if eval_record is None:
-        lines.append("| - | - | - | - | - | - | - | - | - | - | - | - | - | - |")
+        lines.append("| - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - |")
     else:
         lines.append(
             f"| {eval_record['eval_batches_processed']}/{eval_record['eval_batches_available']} | "
@@ -298,8 +317,11 @@ def write_evaluation_report(report_path, run_info, eval_record):
             f"{eval_record['mae']:.6f} | {eval_record['rmse']:.6f} | {eval_record['mape']:.2f}% | "
             f"{eval_record['pred_std']:.6f} | {eval_record['pred_min']:.6f}-{eval_record['pred_max']:.6f} | "
             f"{eval_record['pred_label_pearson']:.6f} | {eval_record['rank_accuracy']:.6f} | "
-            f"{eval_record['tau_pred_mae']:.6f} | {eval_record['tau_pred_std']:.6f} | "
-            f"{eval_record['tau_pred_min']:.6f}-{eval_record['tau_pred_max']:.6f} | "
+            f"{eval_record['clipped_mae']:.6f} | {eval_record['clipped_rmse']:.6f} | "
+            f"{eval_record['clipped_mape']:.2f}% | "
+            f"{eval_record['clipped_pred_min']:.6f}-{eval_record['clipped_pred_max']:.6f} | "
+            f"{eval_record['aux_v_mae']:.6f} | {eval_record['aux_v_std']:.6f} | "
+            f"{eval_record['aux_v_min']:.6f}-{eval_record['aux_v_max']:.6f} | "
             f"{eval_record['tau_sample_min']:.6e}-{eval_record['tau_sample_max']:.6e} | "
             f"{eval_record['log_tau_min']:.6f}-{eval_record['log_tau_max']:.6f} |"
         )
@@ -307,10 +329,19 @@ def write_evaluation_report(report_path, run_info, eval_record):
         lines.extend(["", "### Raw Event Correlations", "", "| Metric | Value |", "| --- | ---: |"])
         for key, value in eval_record.get("correlations", {}).items():
             lines.append(f"| `{key}` | {value:.6f} |")
-        lines.extend(["", "### MAE By Velocity", "", "| Velocity | Samples | MAE | RMSE | MAPE |", "| ---: | ---: | ---: | ---: | ---: |"])
+        lines.extend(
+            [
+                "",
+                "### MAE By Velocity",
+                "",
+                "| Velocity | Samples | Pred Mean | Pred Std | Bias | MAE | RMSE | MAPE |",
+                "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
         for row in eval_record.get("mae_by_velocity", []):
             lines.append(
                 f"| {row['velocity']:.6f} | {row['samples']} | "
+                f"{row['pred_mean']:.6f} | {row['pred_std']:.6f} | {row['bias']:.6f} | "
                 f"{row['mae']:.6f} | {row['rmse']:.6f} | {row['mape']:.2f}% |"
             )
     lines.extend(
@@ -318,8 +349,8 @@ def write_evaluation_report(report_path, run_info, eval_record):
             "",
             "## Notes",
             "",
-            "- Evaluation uses the clean serial SNN-CNN output `v_pred`.",
-            "- Tau metrics use `d / tau_pred`; no beta, raw direct head, fusion head, or patch tau map is used.",
+            "- Final prediction is `d_values / tau_pred` from the sample-level tau head.",
+            "- `v_pred` is auxiliary only; no beta, raw direct head, fusion head, or patch tau map is used.",
             "",
         ]
     )
@@ -331,13 +362,19 @@ def evaluate_generalization():
     start_time = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    total_steps = 5000
-    block_size = 100
+    base_dt_us = 20
+    window_ms = 200
+    base_total_steps = int(window_ms * 1000 / base_dt_us)
+    base_block_size = 400
+    snn_bin_size = 40
+    snn_step_us = base_dt_us * snn_bin_size
+    snn_steps = base_total_steps // snn_bin_size
+    snn_input_scale_mode = "sqrt"
     batch_size = 2
     num_workers = 0
     spatial_shape = (100, 368)
     patch_shape = (50, 46)
-    dt_us = 20
+    dt_us = base_dt_us
     max_velocity = 2.0
     max_eval_batches = None
     event_norm_mode = "source_scale"
@@ -362,6 +399,17 @@ def evaluate_generalization():
     print(f"=> Loading model weights from: {model_weights_path}")
     checkpoint = load_trusted_checkpoint(model_weights_path, map_location=device)
     checkpoint_has_event_norm_stats = isinstance(checkpoint, dict) and "event_norm_stats" in checkpoint
+    if isinstance(checkpoint, dict) and "input_config" in checkpoint:
+        input_config = checkpoint["input_config"]
+        window_ms = int(input_config.get("window_ms", window_ms))
+        base_dt_us = int(input_config.get("base_dt_us", base_dt_us))
+        base_total_steps = int(input_config.get("base_total_steps", base_total_steps))
+        base_block_size = int(input_config.get("base_block_size", base_block_size))
+        snn_bin_size = int(input_config.get("snn_bin_size", snn_bin_size))
+        snn_step_us = int(input_config.get("snn_step_us", base_dt_us * snn_bin_size))
+        snn_steps = int(input_config.get("snn_steps", base_total_steps // snn_bin_size))
+        snn_input_scale_mode = input_config.get("snn_input_scale_mode", snn_input_scale_mode)
+        dt_us = base_dt_us
     checkpoint_event_norm_stats = checkpoint.get("event_norm_stats") if checkpoint_has_event_norm_stats else None
     checkpoint_reference_mean = (
         checkpoint_event_norm_stats.get("reference_mean_events_per_sample")
@@ -394,7 +442,7 @@ def evaluate_generalization():
         data_config=test_data_config,
         mask_path=mask_path,
         T=1,
-        seq_len=total_steps,
+        seq_len=base_total_steps,
         dt_us=dt_us,
         max_velocity=max_velocity,
         event_norm_mode=event_norm_mode,
@@ -424,8 +472,8 @@ def evaluate_generalization():
     )
 
     all_v_true = []
-    all_v_pred = []
-    all_v_from_tau = []
+    all_v_final = []
+    all_v_aux = []
     all_tau_pred = []
     all_log_tau = []
     processed_batches = 0
@@ -451,22 +499,25 @@ def evaluate_generalization():
             )
             model_output = model(
                 dataloader_or_generator=manager,
-                total_steps=total_steps,
-                block_size=block_size,
+                base_total_steps=base_total_steps,
+                base_block_size=base_block_size,
+                snn_bin_size=snn_bin_size,
+                snn_input_scale_mode=snn_input_scale_mode,
+                base_dt_us=base_dt_us,
             )
-            v_pred = model_output["v_pred"]
-            v_from_tau = d_values / torch.clamp(model_output["tau_pred"], min=1e-8)
+            v_aux = model_output["v_pred"]
+            v_final = d_values / torch.clamp(model_output["tau_pred"], min=1e-8)
 
             all_v_true.extend(y_true.numpy().tolist())
-            all_v_pred.extend(v_pred.cpu().numpy().tolist())
-            all_v_from_tau.extend(v_from_tau.cpu().numpy().tolist())
+            all_v_final.extend(v_final.cpu().numpy().tolist())
+            all_v_aux.extend(v_aux.cpu().numpy().tolist())
             all_tau_pred.extend(model_output["tau_pred"].cpu().numpy().tolist())
             all_log_tau.extend(model_output["log_tau_pred"].cpu().numpy().tolist())
             processed_batches += 1
 
             progress_bar.set_postfix(
-                v=f"{v_pred.min().item():.3f}-{v_pred.max().item():.3f}",
-                v_std=f"{v_pred.std(unbiased=False).item():.3e}",
+                final=f"{v_final.min().item():.3f}-{v_final.max().item():.3f}",
+                final_std=f"{v_final.std(unbiased=False).item():.3e}",
             )
         progress_bar.close()
 
@@ -475,26 +526,32 @@ def evaluate_generalization():
         return
 
     v_true_arr = np.asarray(all_v_true, dtype=np.float64)
-    v_pred_arr = np.asarray(all_v_pred, dtype=np.float64)
-    v_tau_arr = np.asarray(all_v_from_tau, dtype=np.float64)
+    v_final_arr = np.asarray(all_v_final, dtype=np.float64)
+    v_aux_arr = np.asarray(all_v_aux, dtype=np.float64)
     tau_arr = np.asarray(all_tau_pred, dtype=np.float64)
     log_tau_arr = np.asarray(all_log_tau, dtype=np.float64)
     eval_order_metadata = eval_order_metadata[:len(v_true_arr)]
-    raw_total_events_arr = np.asarray([meta["raw_total_events"] for meta in eval_order_metadata], dtype=np.float64)
+    raw_total_events_arr = np.asarray(
+        [meta.get("raw_total_events", np.nan) for meta in eval_order_metadata],
+        dtype=np.float64,
+    )
 
     sorted_idx = np.argsort(v_true_arr)
     sorted_v_true = v_true_arr[sorted_idx]
-    sorted_v_pred = v_pred_arr[sorted_idx]
-    sorted_v_tau = v_tau_arr[sorted_idx]
+    sorted_v_pred = v_final_arr[sorted_idx]
+    sorted_v_pred_clipped = np.clip(sorted_v_pred, 0.0, max_velocity)
+    sorted_v_aux = v_aux_arr[sorted_idx]
     sorted_tau = tau_arr[sorted_idx]
     sorted_log_tau = log_tau_arr[sorted_idx]
     sorted_metadata = [eval_order_metadata[i] for i in sorted_idx]
     sorted_raw_total_events = raw_total_events_arr[sorted_idx]
 
     abs_err = np.abs(sorted_v_true - sorted_v_pred)
+    clipped_abs_err = np.abs(sorted_v_true - sorted_v_pred_clipped)
     rel_err_pct = abs_err / np.maximum(np.abs(sorted_v_true), 1e-8) * 100.0
     mae, rmse, mape = compute_scalar_metrics(sorted_v_true, sorted_v_pred)
-    tau_mae, _, _ = compute_scalar_metrics(sorted_v_true, sorted_v_tau)
+    clipped_mae, clipped_rmse, clipped_mape = compute_scalar_metrics(sorted_v_true, sorted_v_pred_clipped)
+    aux_mae, _, _ = compute_scalar_metrics(sorted_v_true, sorted_v_aux)
     correlations = compute_diagnostic_correlations(sorted_v_true, sorted_v_pred, sorted_raw_total_events)
     mae_by_velocity = compute_mae_by_velocity(sorted_v_true, sorted_v_pred)
 
@@ -511,10 +568,16 @@ def evaluate_generalization():
         "pred_max": float(sorted_v_pred.max()) if sorted_v_pred.size else float("nan"),
         "pred_label_pearson": safe_pearson(sorted_v_pred, sorted_v_true),
         "rank_accuracy": pairwise_rank_accuracy(sorted_v_pred, sorted_v_true),
-        "tau_pred_mae": tau_mae,
-        "tau_pred_std": float(sorted_v_tau.std()) if sorted_v_tau.size else float("nan"),
-        "tau_pred_min": float(sorted_v_tau.min()) if sorted_v_tau.size else float("nan"),
-        "tau_pred_max": float(sorted_v_tau.max()) if sorted_v_tau.size else float("nan"),
+        "clipped_mae": clipped_mae,
+        "clipped_rmse": clipped_rmse,
+        "clipped_mape": clipped_mape,
+        "clipped_pred_std": float(sorted_v_pred_clipped.std()) if sorted_v_pred_clipped.size else float("nan"),
+        "clipped_pred_min": float(sorted_v_pred_clipped.min()) if sorted_v_pred_clipped.size else float("nan"),
+        "clipped_pred_max": float(sorted_v_pred_clipped.max()) if sorted_v_pred_clipped.size else float("nan"),
+        "aux_v_mae": aux_mae,
+        "aux_v_std": float(sorted_v_aux.std()) if sorted_v_aux.size else float("nan"),
+        "aux_v_min": float(sorted_v_aux.min()) if sorted_v_aux.size else float("nan"),
+        "aux_v_max": float(sorted_v_aux.max()) if sorted_v_aux.size else float("nan"),
         "tau_sample_min": float(sorted_tau.min()) if sorted_tau.size else float("nan"),
         "tau_sample_max": float(sorted_tau.max()) if sorted_tau.size else float("nan"),
         "log_tau_min": float(sorted_log_tau.min()) if sorted_log_tau.size else float("nan"),
@@ -533,7 +596,8 @@ def evaluate_generalization():
     print(f"=> Pred std: {eval_record['pred_std']:.6f}")
     print(f"=> Pred range: [{eval_record['pred_min']:.6f}, {eval_record['pred_max']:.6f}]")
     print(f"=> Rank acc: {eval_record['rank_accuracy']:.6f}")
-    print(f"=> Tau velocity MAE: {tau_mae:.6f} mm/s")
+    print(f"=> Clipped MAE: {clipped_mae:.6f} mm/s")
+    print(f"=> Aux v MAE: {aux_mae:.6f} mm/s")
     print("=" * 60 + "\n")
 
     with open(save_prediction_path, "w", newline="", encoding="utf-8") as f:
@@ -542,13 +606,18 @@ def evaluate_generalization():
             [
                 "idx",
                 "true_velocity_mm_per_s",
+                "d_value",
                 "pred_velocity_mm_per_s",
-                "tau_velocity_mm_per_s",
+                "pred_velocity_clipped_mm_per_s",
+                "aux_velocity_mm_per_s",
                 "tau_sample_s",
                 "log_tau",
                 "abs_error_mm_per_s",
+                "clipped_abs_error_mm_per_s",
                 "rel_error_pct",
                 "raw_total_events",
+                "normalized_total_events",
+                "seq_start_idx",
                 "source_path",
                 "file_path",
             ]
@@ -558,22 +627,27 @@ def evaluate_generalization():
                 [
                     row_idx,
                     sorted_v_true[row_idx],
+                    meta.get("d_val", np.nan),
                     sorted_v_pred[row_idx],
-                    sorted_v_tau[row_idx],
+                    sorted_v_pred_clipped[row_idx],
+                    sorted_v_aux[row_idx],
                     sorted_tau[row_idx],
                     sorted_log_tau[row_idx],
                     abs_err[row_idx],
+                    clipped_abs_err[row_idx],
                     rel_err_pct[row_idx],
                     sorted_raw_total_events[row_idx],
-                    meta["source_path"],
-                    meta["file_path"],
+                    meta.get("normalized_total_events_est", np.nan),
+                    meta.get("seq_start_idx", ""),
+                    meta.get("source_path", ""),
+                    meta.get("file_path", ""),
                 ]
             )
 
     plt.figure(figsize=(12, 6))
     plt.plot(range(len(sorted_v_true)), sorted_v_true, label="True velocity", color="black", linewidth=2)
-    plt.plot(range(len(sorted_v_pred)), sorted_v_pred, label="Pred velocity", color="red", linestyle="--")
-    plt.plot(range(len(sorted_v_tau)), sorted_v_tau, label="Tau-derived velocity", color="blue", linestyle=":")
+    plt.plot(range(len(sorted_v_pred)), sorted_v_pred, label="Final d/tau velocity", color="red", linestyle="--")
+    plt.plot(range(len(sorted_v_aux)), sorted_v_aux, label="Aux v_pred", color="blue", linestyle=":")
     plt.xlabel("Sample index sorted by true velocity")
     plt.ylabel("Velocity (mm/s)")
     plt.title("Clean Serial SNN-CNN Generalization")
@@ -595,8 +669,14 @@ def evaluate_generalization():
             "generalization_output_dir": generalization_output_dir,
             "save_plot_path": save_plot_path,
             "save_prediction_path": save_prediction_path,
-            "total_steps": total_steps,
-            "block_size": block_size,
+            "window_ms": window_ms,
+            "base_dt_us": base_dt_us,
+            "base_total_steps": base_total_steps,
+            "base_block_size": base_block_size,
+            "snn_bin_size": snn_bin_size,
+            "snn_step_us": snn_step_us,
+            "snn_steps": snn_steps,
+            "snn_input_scale_mode": snn_input_scale_mode,
             "batch_size": batch_size,
             "dt_us": dt_us,
             "spatial_shape": spatial_shape,

@@ -2,6 +2,7 @@ import os
 os.environ["OMP_NUM_THREADS"] = "8"
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+import csv
 import time
 from datetime import datetime
 
@@ -73,6 +74,31 @@ def safe_pearson(x, y):
     return float(np.corrcoef(x, y)[0, 1])
 
 
+def safe_spearman(x, y):
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    finite = np.isfinite(x) & np.isfinite(y)
+    x = x[finite]
+    y = y[finite]
+    if x.size < 2 or y.size < 2:
+        return float("nan")
+
+    def ranks(values):
+        order = np.argsort(values, kind="mergesort")
+        result = np.empty_like(order, dtype=np.float64)
+        sorted_values = values[order]
+        start = 0
+        while start < values.size:
+            end = start + 1
+            while end < values.size and sorted_values[end] == sorted_values[start]:
+                end += 1
+            result[order[start:end]] = 0.5 * (start + end - 1)
+            start = end
+        return result
+
+    return safe_pearson(ranks(x), ranks(y))
+
+
 def pairwise_rank_accuracy(pred, target):
     pred = np.asarray(pred, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64)
@@ -89,7 +115,7 @@ def pairwise_rank_accuracy(pred, target):
     return float(np.mean(pred_diff[valid] > 0))
 
 
-def is_better_checkpoint(val_stats, best_stats, mae_tol=1e-6, metric_tol=1e-6):
+def is_better_checkpoint(val_stats, best_stats, mae_tol=0.005, metric_tol=1e-6):
     if not np.isfinite(val_stats.get("mae", float("nan"))) or not np.isfinite(val_stats.get("loss", float("nan"))):
         return False
     if best_stats is not None and val_stats.get("pred_std", 0.0) < 1e-6:
@@ -101,6 +127,9 @@ def is_better_checkpoint(val_stats, best_stats, mae_tol=1e-6, metric_tol=1e-6):
     if val_stats["mae"] > best_stats["mae"] + mae_tol:
         return False
     tie_breakers = [
+        ("bin_mae_max", False),
+        ("max_abs_bin_bias", False),
+        ("high_speed_mae", False),
         ("rank_accuracy", True),
         ("pred_std", True),
         ("loss", False),
@@ -125,6 +154,20 @@ def is_better_checkpoint(val_stats, best_stats, mae_tol=1e-6, metric_tol=1e-6):
             if current > best + metric_tol:
                 return False
     return False
+
+
+def is_oom_error(error):
+    message = str(error).lower()
+    return "out of memory" in message or "cuda error: out of memory" in message
+
+
+def unpack_batch(batch):
+    if len(batch) == 6:
+        x_seq_sparse_data, y_true, d_values, env_maps, source_ids, metadata = batch
+    else:
+        x_seq_sparse_data, y_true, d_values, env_maps, source_ids = batch
+        metadata = None
+    return x_seq_sparse_data, y_true, d_values, env_maps, source_ids, metadata
 
 
 def pairwise_ranking_loss(pred, target, margin=0.12):
@@ -191,6 +234,131 @@ def compute_training_loss(model_output, d_values, y_true, loss_weights):
         "v_aux_loss": loss_v_aux,
         "tau_delta_reg_loss": loss_tau_delta_reg,
     }, v_final
+
+
+def compute_per_velocity_stats(v_true, v_pred):
+    v_true = np.asarray(v_true, dtype=np.float64)
+    v_pred = np.asarray(v_pred, dtype=np.float64)
+    rows = []
+    for velocity in sorted(np.unique(v_true[np.isfinite(v_true)])):
+        mask = np.isfinite(v_true) & np.isfinite(v_pred) & np.isclose(v_true, velocity, atol=1e-6)
+        if not np.any(mask):
+            continue
+        pred_values = v_pred[mask]
+        true_values = v_true[mask]
+        mae, rmse, mape = compute_scalar_metrics(true_values, pred_values)
+        pred_mean = float(pred_values.mean())
+        rows.append(
+            {
+                "velocity": float(velocity),
+                "samples": int(mask.sum()),
+                "pred_mean": pred_mean,
+                "pred_std": float(pred_values.std()),
+                "bias": pred_mean - float(velocity),
+                "mae": mae,
+                "rmse": rmse,
+                "mape": mape,
+            }
+        )
+    return rows
+
+
+def summarize_per_velocity(per_velocity_rows):
+    if not per_velocity_rows:
+        return {
+            "bin_mae_mean": float("nan"),
+            "bin_mae_max": float("nan"),
+            "max_abs_bin_bias": float("nan"),
+            "high_speed_mae": float("nan"),
+        }
+    maes = np.asarray([row["mae"] for row in per_velocity_rows], dtype=np.float64)
+    biases = np.asarray([row["bias"] for row in per_velocity_rows], dtype=np.float64)
+    high_speed_maes = np.asarray(
+        [row["mae"] for row in per_velocity_rows if row["velocity"] >= 1.5],
+        dtype=np.float64,
+    )
+    return {
+        "bin_mae_mean": float(np.nanmean(maes)),
+        "bin_mae_max": float(np.nanmax(maes)),
+        "max_abs_bin_bias": float(np.nanmax(np.abs(biases))),
+        "high_speed_mae": float(np.nanmean(high_speed_maes)) if high_speed_maes.size else float("nan"),
+    }
+
+
+def compute_raw_dependency_diagnostics(v_true, v_pred, raw_total_events):
+    raw = np.asarray(raw_total_events, dtype=np.float64)
+    if raw.size == 0 or not np.any(np.isfinite(raw)):
+        return {
+            "raw_event_warning": "raw_total_events unavailable",
+            "pred_vs_raw_total_events_pearson": float("nan"),
+            "pred_vs_raw_total_events_spearman": float("nan"),
+            "label_vs_raw_total_events_pearson": float("nan"),
+            "abs_error_vs_raw_total_events_pearson": float("nan"),
+            "abs_error_vs_raw_total_events_spearman": float("nan"),
+        }
+    v_true = np.asarray(v_true, dtype=np.float64)
+    v_pred = np.asarray(v_pred, dtype=np.float64)
+    abs_error = np.abs(v_pred - v_true)
+    return {
+        "raw_event_warning": "",
+        "pred_vs_raw_total_events_pearson": safe_pearson(v_pred, raw),
+        "pred_vs_raw_total_events_spearman": safe_spearman(v_pred, raw),
+        "label_vs_raw_total_events_pearson": safe_pearson(v_true, raw),
+        "abs_error_vs_raw_total_events_pearson": safe_pearson(abs_error, raw),
+        "abs_error_vs_raw_total_events_spearman": safe_spearman(abs_error, raw),
+    }
+
+
+def save_validation_predictions_csv(path, val_stats):
+    metadata_list = val_stats.get("metadata", [])
+    v_true = np.asarray(val_stats.get("v_true", []), dtype=np.float64)
+    v_pred = np.asarray(val_stats.get("v_pred", []), dtype=np.float64)
+    v_aux = np.asarray(val_stats.get("v_aux", []), dtype=np.float64)
+    d_values = np.asarray(val_stats.get("d_values", []), dtype=np.float64)
+    tau_pred = np.asarray(val_stats.get("tau_pred_values", []), dtype=np.float64)
+    log_tau = np.asarray(val_stats.get("log_tau_values", []), dtype=np.float64)
+    rows = max(len(v_true), len(metadata_list))
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "source",
+                "sample_id",
+                "velocity_true",
+                "d_value",
+                "tau_pred",
+                "log_tau_pred",
+                "v_final",
+                "v_final_clipped",
+                "v_pred_aux",
+                "abs_error",
+                "clipped_abs_error",
+                "raw_total_events",
+                "normalized_total_events",
+            ]
+        )
+        for idx in range(rows):
+            meta = metadata_list[idx] if idx < len(metadata_list) and isinstance(metadata_list[idx], dict) else {}
+            true_value = v_true[idx] if idx < v_true.size else float("nan")
+            final_value = v_pred[idx] if idx < v_pred.size else float("nan")
+            clipped_value = float(np.clip(final_value, 0.0, 2.0)) if np.isfinite(final_value) else float("nan")
+            writer.writerow(
+                [
+                    meta.get("source_path", ""),
+                    meta.get("seq_start_idx", idx),
+                    true_value,
+                    d_values[idx] if idx < d_values.size else float("nan"),
+                    tau_pred[idx] if idx < tau_pred.size else float("nan"),
+                    log_tau[idx] if idx < log_tau.size else float("nan"),
+                    final_value,
+                    clipped_value,
+                    v_aux[idx] if idx < v_aux.size else float("nan"),
+                    abs(final_value - true_value) if np.isfinite(final_value) and np.isfinite(true_value) else float("nan"),
+                    abs(clipped_value - true_value) if np.isfinite(clipped_value) and np.isfinite(true_value) else float("nan"),
+                    meta.get("raw_total_events", float("nan")),
+                    meta.get("normalized_total_events_est", float("nan")),
+                ]
+            )
 
 
 def format_duration(elapsed_seconds):
@@ -404,8 +572,9 @@ def write_training_report(report_path, run_info, epoch_records):
         f"- Best epoch: `{run_info['best_epoch']}`",
         f"- Best validation loss: `{run_info['best_val_loss']:.6f}`" if run_info["best_epoch"] >= 0 else "- Best validation loss: `N/A`",
         f"- Best validation final MAE: `{run_info['best_val_mae']:.6f}`" if run_info["best_epoch"] >= 0 else "- Best validation final MAE: `N/A`",
-        "- Best checkpoint tie-breakers: `val_final_mae`, `final_rank_accuracy`, `final_pred_std`, `val_loss`",
+        "- Best checkpoint tie-breakers when `val_final_mae` is within `0.005`: `val_bin_mae_max`, `val_max_abs_bin_bias`, `val_high_speed_mae`, `final_rank_accuracy`, `final_pred_std`, `val_loss`",
         f"- Model weights path: `{run_info['model_weights_path']}`",
+        f"- Best validation prediction CSV: `{run_info.get('best_val_predictions_path', '')}`",
         f"- Loss curve path: `{run_info['loss_curve_path']}`",
         "",
         "## Run Config",
@@ -418,7 +587,9 @@ def write_training_report(report_path, run_info, epoch_records):
         f"- snn_step_us: `{run_info['snn_step_us']}`",
         f"- snn_steps: `{run_info['snn_steps']}`",
         f"- snn_input_scale_mode: `{run_info['snn_input_scale_mode']}`",
-        f"- batch_size: `{run_info['batch_size']}`",
+        f"- requested_batch_size: `{run_info.get('requested_batch_size', run_info['batch_size'])}`",
+        f"- effective_batch_size: `{run_info['batch_size']}`",
+        f"- oom_fallback_used: `{run_info.get('oom_fallback_used', False)}`",
         f"- epochs: `{run_info['epochs']}`",
         f"- dt_us: `{run_info['dt_us']}`",
         f"- spatial_shape: `{run_info['spatial_shape']}`",
@@ -516,6 +687,9 @@ def write_training_report(report_path, run_info, epoch_records):
                 "",
                 f"- passed: `{smoke.get('passed')}`",
                 f"- reason: `{smoke.get('reason', '')}`",
+                f"- v_final_shape: `{smoke.get('v_final_shape')}`",
+                f"- v_final_range: `{smoke.get('v_final_min', float('nan')):.6f}-{smoke.get('v_final_max', float('nan')):.6f}`",
+                f"- v_final_std: `{smoke.get('v_final_std', float('nan')):.6e}`",
                 f"- v_pred_shape: `{smoke.get('v_pred_shape')}`",
                 f"- tau_pred_shape: `{smoke.get('tau_pred_shape')}`",
                 f"- v_pred_range: `{smoke.get('v_pred_min', float('nan')):.6f}-{smoke.get('v_pred_max', float('nan')):.6f}`",
@@ -538,6 +712,7 @@ def write_training_report(report_path, run_info, epoch_records):
         "Train Rank Loss", "Train Final Var Loss", "Train Aux V Loss",
         "Val Loss", "Val Final MAE", "Val Final RMSE", "Val Final MAPE", "Final Pred Std", "Final Pred Range",
         "Final Pred/Label Pearson", "Final Rank Acc",
+        "Val Bin MAE Mean", "Val Bin MAE Max", "Val Max Abs Bin Bias", "Val High Speed MAE",
         "Aux V MAE", "Aux V Std", "Aux V Range", "Tau Sample Range", "Log Tau Pred Range",
         "Feat1 Mean", "Feat1 Std", "Feat2 Mean", "Feat2 Std", "Feat3 Mean", "Feat3 Std",
         "CNN Embedding Std", "Layer1 Spike Rate", "Layer2 Spike Rate", "Layer3 Spike Rate",
@@ -569,6 +744,8 @@ def write_training_report(report_path, run_info, epoch_records):
                 f"{record['val_mape']:.2f}% | {record['val_pred_std']:.6f} | "
                 f"{record['val_pred_min']:.6f}-{record['val_pred_max']:.6f} | "
                 f"{record['val_pred_label_pearson']:.6f} | {record['val_rank_accuracy']:.6f} | "
+                f"{record['val_bin_mae_mean']:.6f} | {record['val_bin_mae_max']:.6f} | "
+                f"{record['val_max_abs_bin_bias']:.6f} | {record['val_high_speed_mae']:.6f} | "
                 f"{record['val_aux_v_mae']:.6f} | {record['val_aux_v_std']:.6f} | "
                 f"{record['val_aux_v_min']:.6f}-{record['val_aux_v_max']:.6f} | "
                 f"{record['val_tau_sample_min']:.6e}-{record['val_tau_sample_max']:.6e} | "
@@ -581,6 +758,48 @@ def write_training_report(report_path, run_info, epoch_records):
                 f"{record['val_layer3_spike_rate']:.6e} |"
             )
 
+    best_per_velocity = run_info.get("best_per_velocity", [])
+    lines.extend(
+        [
+            "",
+            "## Best Epoch Per-Velocity Validation",
+            "",
+            "| Velocity | Samples | Pred Mean | Pred Std | Bias | MAE | RMSE | MAPE |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    if best_per_velocity:
+        for row in best_per_velocity:
+            lines.append(
+                f"| {row['velocity']:.6f} | {row['samples']} | {row['pred_mean']:.6f} | "
+                f"{row['pred_std']:.6f} | {row['bias']:.6f} | {row['mae']:.6f} | "
+                f"{row['rmse']:.6f} | {row['mape']:.2f}% |"
+            )
+    else:
+        lines.append("| - | - | - | - | - | - | - | - |")
+
+    raw_diag = run_info.get("best_raw_dependency", {})
+    lines.extend(
+        [
+            "",
+            "## Best Epoch Raw Event Dependency",
+            "",
+            f"- warning: `{raw_diag.get('raw_event_warning', '')}`",
+            "",
+            "| Metric | Value |",
+            "| --- | ---: |",
+        ]
+    )
+    for key in (
+        "pred_vs_raw_total_events_pearson",
+        "pred_vs_raw_total_events_spearman",
+        "label_vs_raw_total_events_pearson",
+        "abs_error_vs_raw_total_events_pearson",
+        "abs_error_vs_raw_total_events_spearman",
+    ):
+        value = raw_diag.get(key, float("nan"))
+        lines.append(f"| `{key}` | {value:.6f} |")
+
     lines.extend(
         [
             "",
@@ -588,6 +807,9 @@ def write_training_report(report_path, run_info, epoch_records):
             "",
             "- Final prediction is `d_values / tau_pred` from the sample-level tau head.",
             "- `v_pred` is auxiliary only and is not used for checkpoint selection.",
+            "- Training uses 200ms window and 800us pseudo-frame.",
+            "- Legacy SNN neuron with kernel_norm normalization is used.",
+            "- Train event intensity jitter is enabled only for train split.",
             "- No raw direct head, no teacher distillation, no fusion, no beta, no patch tau map.",
             "- Dataset keeps 20us base bins; each SNN step is a sqrt-scaled aggregate of 40 base bins.",
             "- SNN feature diagnostics report accumulated post-SNN feature maps before CNN decoding.",
@@ -652,6 +874,9 @@ def run_epoch(
     all_v_aux = []
     all_tau_pred = []
     all_log_tau_pred = []
+    all_d_values = []
+    all_metadata = []
+    all_raw_total_events = []
 
     context = torch.enable_grad() if is_train else torch.no_grad()
     max_batches = len(data_loader) if max_batches is None else min(max_batches, len(data_loader))
@@ -665,9 +890,10 @@ def run_epoch(
     )
 
     with context:
-        for batch_idx, (x_seq_sparse_data, y_true, d_values, env_maps, source_ids) in progress_bar:
+        for batch_idx, batch in progress_bar:
             if batch_idx >= max_batches:
                 break
+            x_seq_sparse_data, y_true, d_values, env_maps, source_ids, metadata = unpack_batch(batch)
 
             y_true = y_true.to(device)
             d_values = d_values.to(device)
@@ -714,6 +940,17 @@ def run_epoch(
             all_v_aux.extend(v_pred_aux.detach().cpu().numpy().tolist())
             all_tau_pred.extend(model_output["tau_pred"].detach().cpu().numpy().tolist())
             all_log_tau_pred.extend(model_output["log_tau_pred"].detach().cpu().numpy().tolist())
+            all_d_values.extend(d_values.detach().cpu().numpy().tolist())
+            if metadata is not None:
+                all_metadata.extend(metadata)
+                all_raw_total_events.extend(
+                    [
+                        float(meta.get("raw_total_events", float("nan"))) if isinstance(meta, dict) else float("nan")
+                        for meta in metadata
+                    ]
+                )
+            else:
+                all_raw_total_events.extend([float("nan")] * int(y_true.shape[0]))
 
             v_batch = v_final.detach().cpu()
             aux_batch = v_pred_aux.detach().cpu()
@@ -758,6 +995,9 @@ def run_epoch(
     tau_sample_max = float(tau_pred_arr.max()) if tau_pred_arr.size else float("nan")
     log_tau_min = float(log_tau_arr.min()) if log_tau_arr.size else float("nan")
     log_tau_max = float(log_tau_arr.max()) if log_tau_arr.size else float("nan")
+    per_velocity_rows = compute_per_velocity_stats(v_true_arr, v_final_arr)
+    per_velocity_summary = summarize_per_velocity(per_velocity_rows)
+    raw_dependency = compute_raw_dependency_diagnostics(v_true_arr, v_final_arr, all_raw_total_events)
 
     return {
         "loss": avg_loss,
@@ -781,6 +1021,9 @@ def run_epoch(
         "tau_sample_max": tau_sample_max,
         "log_tau_pred_min": log_tau_min,
         "log_tau_pred_max": log_tau_max,
+        "per_velocity": per_velocity_rows,
+        **per_velocity_summary,
+        "raw_dependency": raw_dependency,
         **avg_feature_diag,
         "processed_batches": processed_batches,
         "available_batches": len(data_loader),
@@ -789,6 +1032,11 @@ def run_epoch(
         "v_true": all_v_true,
         "v_pred": all_v_final,
         "v_aux": all_v_aux,
+        "d_values": all_d_values,
+        "tau_pred_values": all_tau_pred,
+        "log_tau_values": all_log_tau_pred,
+        "metadata": all_metadata,
+        "raw_total_events": all_raw_total_events,
     }
 
 
@@ -806,8 +1054,10 @@ def run_smoke_test(
 ):
     model.eval()
     with torch.no_grad():
-        x_seq_sparse_data, y_true, d_values, env_maps, source_ids = next(iter(data_loader))
+        batch = next(iter(data_loader))
+        x_seq_sparse_data, y_true, d_values, env_maps, source_ids, metadata = unpack_batch(batch)
         y_true = y_true.to(device)
+        d_values = d_values.to(device)
         manager = DenseBlockManager(
             x_seq_sparse_data,
             batch_size=y_true.shape[0],
@@ -825,6 +1075,7 @@ def run_smoke_test(
 
     v_pred = output["v_pred"].detach()
     tau_pred = output["tau_pred"].detach()
+    v_final = d_values / torch.clamp(tau_pred, min=1e-8)
     feat1_std = float(output["snn_feat_1"].detach().std(unbiased=False).cpu())
     feat2_std = float(output["snn_feat_2"].detach().std(unbiased=False).cpu())
     feat3_std = float(output["snn_feat_3"].detach().std(unbiased=False).cpu())
@@ -833,7 +1084,11 @@ def run_smoke_test(
         "passed": False,
         "reason": "",
         "v_pred_shape": list(v_pred.shape),
+        "v_final_shape": list(v_final.shape),
         "tau_pred_shape": list(tau_pred.shape),
+        "v_final_min": float(v_final.min().cpu()),
+        "v_final_max": float(v_final.max().cpu()),
+        "v_final_std": float(v_final.std(unbiased=False).cpu()),
         "v_pred_min": float(v_pred.min().cpu()),
         "v_pred_max": float(v_pred.max().cpu()),
         "v_pred_std": float(v_pred.std(unbiased=False).cpu()),
@@ -849,10 +1104,14 @@ def run_smoke_test(
     }
     expected_shape = [int(y_true.shape[0])]
     checks = [
-        (stats["v_pred_shape"] == expected_shape, "v_pred shape mismatch"),
+        (stats["v_final_shape"] == expected_shape, "v_final shape mismatch"),
         (stats["tau_pred_shape"] == expected_shape, "tau_pred shape mismatch"),
         (stats["layer1_spike_rate"] > 0.0, "layer1 spike rate is zero"),
+        (stats["layer2_spike_rate"] > 0.0, "layer2 spike rate is zero"),
+        (stats["layer3_spike_rate"] > 0.0, "layer3 spike rate is zero"),
         (stats["feat1_std"] > 0.0, "feat1 std is zero"),
+        (stats["feat2_std"] > 0.0, "feat2 std is zero"),
+        (stats["feat3_std"] > 0.0, "feat3 std is zero"),
         (np.isfinite(stats["cnn_embedding_std"]), "cnn embedding std is not finite"),
     ]
     failed = [message for ok, message in checks if not ok]
@@ -862,6 +1121,46 @@ def run_smoke_test(
         stats["passed"] = True
         stats["reason"] = "ok"
     return stats
+
+
+def run_backward_oom_probe(
+    model,
+    data_loader,
+    device,
+    base_total_steps,
+    base_block_size,
+    snn_bin_size,
+    snn_input_scale_mode,
+    base_dt_us,
+    spatial_shape,
+    patch_shape,
+    loss_weights,
+):
+    model.train(True)
+    batch = next(iter(data_loader))
+    x_seq_sparse_data, y_true, d_values, env_maps, source_ids, metadata = unpack_batch(batch)
+    y_true = y_true.to(device)
+    d_values = d_values.to(device)
+    manager = DenseBlockManager(
+        x_seq_sparse_data,
+        batch_size=y_true.shape[0],
+        spatial_shape=spatial_shape,
+        patch_shape=patch_shape,
+    )
+    model.zero_grad(set_to_none=True)
+    output = model(
+        dataloader_or_generator=manager,
+        base_total_steps=base_total_steps,
+        base_block_size=base_block_size,
+        snn_bin_size=snn_bin_size,
+        snn_input_scale_mode=snn_input_scale_mode,
+        base_dt_us=base_dt_us,
+    )
+    loss, _, _ = compute_training_loss(output, d_values, y_true, loss_weights)
+    loss.backward()
+    model.zero_grad(set_to_none=True)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def train_cross_env():
@@ -876,17 +1175,19 @@ def train_cross_env():
     snn_step_us = base_dt_us * snn_bin_size
     snn_steps = base_total_steps // snn_bin_size
     snn_input_scale_mode = "sqrt"
-    batch_size = 2
+    requested_batch_size = 4
+    batch_size = requested_batch_size
+    oom_fallback_used = False
     num_workers = 0
     spatial_shape = (100, 368)
     patch_shape = (50, 46)
     dt_us = base_dt_us
     max_velocity = 2.0
-    max_train_batches = 120
+    max_train_batches = 60
     max_val_batches = None
     event_norm_mode = "source_scale"
     event_norm_clip = (0.25, 4.0)
-    train_event_intensity_jitter_range = None
+    train_event_intensity_jitter_range = (0.95, 1.05)
     val_event_intensity_jitter_range = None
     optimizer_name = "Adam"
     scheduler_name = "ReduceLROnPlateau"
@@ -928,6 +1229,12 @@ def train_cross_env():
             "lr": 2e-5,
             "loss_weights": main_loss_weights,
         },
+        {
+            "name": "stage4_refine",
+            "epochs": 10,
+            "lr": 1e-5,
+            "loss_weights": main_loss_weights,
+        },
     ]
     epochs = sum(stage["epochs"] for stage in stage_schedule)
     optimizer_lr = stage_schedule[0]["lr"]
@@ -947,6 +1254,7 @@ def train_cross_env():
     report_dir = "/data/zm/Moshaboli/new_data/Markdown"
     report_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_path = os.path.join(report_dir, f"train_cross_{report_timestamp}.md")
+    best_val_predictions_path = os.path.join(report_dir, "best_val_predictions.csv")
 
     os.makedirs(os.path.dirname(model_weights_path), exist_ok=True)
     os.makedirs(os.path.dirname(loss_curve_path), exist_ok=True)
@@ -963,6 +1271,7 @@ def train_cross_env():
         event_norm_reference_mean=None,
         event_norm_clip=event_norm_clip,
         event_intensity_jitter_range=train_event_intensity_jitter_range,
+        return_metadata=True,
     )
     train_event_norm_stats = train_ds.get_reference_event_norm_stats()
     val_ds = FlexibleBloodFlowDataset(
@@ -977,112 +1286,171 @@ def train_cross_env():
         event_norm_reference_mean=train_event_norm_stats["reference_mean_events_per_sample"],
         event_norm_clip=event_norm_clip,
         event_intensity_jitter_range=val_event_intensity_jitter_range,
+        return_metadata=True,
     )
 
-    train_sampling_plan = compute_source_velocity_sampling_plan(train_ds, batch_size, max_train_batches, "Train")
-    val_sampling_plan = compute_source_velocity_sampling_plan(val_ds, batch_size, max_val_batches, "Val")
-    val_loader, val_sampling_plan = build_source_velocity_loader(
-        dataset=val_ds,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        collate_fn=sequence_sparse_collate,
-        max_batches=max_val_batches,
-        split_name="Val",
-        epoch_idx=0,
-    )
+    def build_state_for_batch_size(candidate_batch_size, candidate_max_train_batches):
+        candidate_train_plan = compute_source_velocity_sampling_plan(
+            train_ds,
+            candidate_batch_size,
+            candidate_max_train_batches,
+            "Train",
+        )
+        candidate_val_loader, candidate_val_plan = build_source_velocity_loader(
+            dataset=val_ds,
+            batch_size=candidate_batch_size,
+            num_workers=num_workers,
+            collate_fn=sequence_sparse_collate,
+            max_batches=max_val_batches,
+            split_name="Val",
+            epoch_idx=0,
+        )
+        candidate_model = SNN_CNN_Hybrid(in_channels=1, max_velocity=max_velocity).to(device)
+        candidate_optimizer = torch.optim.Adam(candidate_model.parameters(), lr=optimizer_lr)
+        candidate_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            candidate_optimizer,
+            mode=scheduler_mode,
+            factor=scheduler_factor,
+            patience=scheduler_patience,
+        )
+        candidate_smoke_loader, _ = build_source_velocity_loader(
+            dataset=train_ds,
+            batch_size=candidate_batch_size,
+            num_workers=num_workers,
+            collate_fn=sequence_sparse_collate,
+            max_batches=candidate_max_train_batches,
+            split_name="Train",
+            epoch_idx=0,
+        )
+        candidate_smoke = run_smoke_test(
+            candidate_model,
+            candidate_smoke_loader,
+            device,
+            base_total_steps,
+            base_block_size,
+            snn_bin_size,
+            snn_input_scale_mode,
+            base_dt_us,
+            spatial_shape,
+            patch_shape,
+        )
+        return (
+            candidate_train_plan,
+            candidate_val_loader,
+            candidate_val_plan,
+            candidate_model,
+            candidate_optimizer,
+            candidate_scheduler,
+            candidate_smoke,
+        )
 
+    try:
+        (
+            train_sampling_plan,
+            val_loader,
+            val_sampling_plan,
+            model,
+            optimizer,
+            scheduler,
+            smoke_test_stats,
+        ) = build_state_for_batch_size(batch_size, max_train_batches)
+    except RuntimeError as error:
+        if not is_oom_error(error) or batch_size == 2:
+            raise
+        print("Batch size 4 smoke test OOM; falling back to batch size 2.")
+        oom_fallback_used = True
+        batch_size = 2
+        max_train_batches = 120
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        (
+            train_sampling_plan,
+            val_loader,
+            val_sampling_plan,
+            model,
+            optimizer,
+            scheduler,
+            smoke_test_stats,
+        ) = build_state_for_batch_size(batch_size, max_train_batches)
+
+    print(f"Smoke test | {smoke_test_stats}")
+    if not smoke_test_stats["passed"]:
+        raise RuntimeError(f"Smoke test failed: {smoke_test_stats['reason']}")
+    try:
+        backward_probe_loader, _ = build_source_velocity_loader(
+            dataset=train_ds,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            collate_fn=sequence_sparse_collate,
+            max_batches=max_train_batches,
+            split_name="Train",
+            epoch_idx=0,
+        )
+        run_backward_oom_probe(
+            model,
+            backward_probe_loader,
+            device,
+            base_total_steps,
+            base_block_size,
+            snn_bin_size,
+            snn_input_scale_mode,
+            base_dt_us,
+            spatial_shape,
+            patch_shape,
+            main_loss_weights,
+        )
+    except RuntimeError as error:
+        if not is_oom_error(error) or batch_size == 2:
+            raise
+        print("Batch size 4 backward probe OOM; falling back to batch size 2.")
+        oom_fallback_used = True
+        batch_size = 2
+        max_train_batches = 120
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        (
+            train_sampling_plan,
+            val_loader,
+            val_sampling_plan,
+            model,
+            optimizer,
+            scheduler,
+            smoke_test_stats,
+        ) = build_state_for_batch_size(batch_size, max_train_batches)
+        if not smoke_test_stats["passed"]:
+            raise RuntimeError(f"Smoke test failed after fallback: {smoke_test_stats['reason']}")
+        fallback_probe_loader, _ = build_source_velocity_loader(
+            dataset=train_ds,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            collate_fn=sequence_sparse_collate,
+            max_batches=max_train_batches,
+            split_name="Train",
+            epoch_idx=0,
+        )
+        run_backward_oom_probe(
+            model,
+            fallback_probe_loader,
+            device,
+            base_total_steps,
+            base_block_size,
+            snn_bin_size,
+            snn_input_scale_mode,
+            base_dt_us,
+            spatial_shape,
+            patch_shape,
+            main_loss_weights,
+        )
+
+    trainable_total_parameters = count_trainable_parameters(model)
     print(
         f"Dataset summary | train_samples={len(train_ds)}, "
         f"train_batches={train_sampling_plan['effective_batches']}, "
         f"val_samples={len(val_ds)}, val_batches={val_sampling_plan['effective_batches']}"
     )
+    print(f"Batch size | requested={requested_batch_size}, effective={batch_size}, oom_fallback={oom_fallback_used}")
     print(f"Stage schedule | {stage_schedule}")
     print(f"Training report will be saved to {report_path}")
-
-    model = SNN_CNN_Hybrid(in_channels=1, max_velocity=max_velocity).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=optimizer_lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode=scheduler_mode,
-        factor=scheduler_factor,
-        patience=scheduler_patience,
-    )
-    trainable_total_parameters = count_trainable_parameters(model)
-    smoke_loader, _ = build_source_velocity_loader(
-        dataset=train_ds,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        collate_fn=sequence_sparse_collate,
-        max_batches=max_train_batches,
-        split_name="Train",
-        epoch_idx=0,
-    )
-    smoke_test_stats = run_smoke_test(
-        model,
-        smoke_loader,
-        device,
-        base_total_steps,
-        base_block_size,
-        snn_bin_size,
-        snn_input_scale_mode,
-        base_dt_us,
-        spatial_shape,
-        patch_shape,
-    )
-    print(f"Smoke test | {smoke_test_stats}")
-    if not smoke_test_stats["passed"]:
-        run_info = {
-            "timestamp": report_timestamp,
-            "status": "failed_smoke_test",
-            "device": str(device),
-            "elapsed": time.time() - start_time,
-            "best_epoch": -1,
-            "best_val_loss": float("inf"),
-            "best_val_mae": float("inf"),
-            "model_weights_path": model_weights_path,
-            "loss_curve_path": loss_curve_path,
-            "window_ms": window_ms,
-            "base_dt_us": base_dt_us,
-            "base_total_steps": base_total_steps,
-            "base_block_size": base_block_size,
-            "snn_bin_size": snn_bin_size,
-            "snn_step_us": snn_step_us,
-            "snn_steps": snn_steps,
-            "snn_input_scale_mode": snn_input_scale_mode,
-            "batch_size": batch_size,
-            "epochs": epochs,
-            "dt_us": dt_us,
-            "num_workers": num_workers,
-            "omp_num_threads": os.environ.get("OMP_NUM_THREADS", ""),
-            "spatial_shape": spatial_shape,
-            "patch_shape": patch_shape,
-            "max_velocity": max_velocity,
-            "max_train_batches": max_train_batches,
-            "max_val_batches": max_val_batches,
-            "event_norm_mode": event_norm_mode,
-            "event_norm_clip": event_norm_clip,
-            "train_event_intensity_jitter_range": train_event_intensity_jitter_range,
-            "optimizer_name": optimizer_name,
-            "optimizer_lr": optimizer_lr,
-            "scheduler_name": scheduler_name,
-            "scheduler_mode": scheduler_mode,
-            "scheduler_factor": scheduler_factor,
-            "scheduler_patience": scheduler_patience,
-            "gradient_clip_max_norm": gradient_clip_max_norm,
-            "trainable_total_parameters": trainable_total_parameters,
-            "stage_schedule": stage_schedule,
-            "train_sampling_plan": train_sampling_plan,
-            "val_sampling_plan": val_sampling_plan,
-            "train_batches": train_sampling_plan["effective_batches"],
-            "val_batches": val_sampling_plan["effective_batches"],
-            "train_env_config": train_env_config,
-            "val_env_config": val_env_config,
-            "train_ds": train_ds,
-            "val_ds": val_ds,
-            "smoke_test": smoke_test_stats,
-        }
-        write_training_report(report_path, run_info, [])
-        raise RuntimeError(f"Smoke test failed: {smoke_test_stats['reason']}")
 
     train_loss_history = []
     val_loss_history = []
@@ -1090,6 +1458,8 @@ def train_cross_env():
     best_val_mae = float("inf")
     best_checkpoint_stats = None
     best_epoch = -1
+    best_per_velocity_rows = []
+    best_raw_dependency = {}
     epoch_records = []
     run_status = "completed"
     active_stage_name = None
@@ -1198,6 +1568,10 @@ def train_cross_env():
                     "val_pred_max": val_stats["pred_max"],
                     "val_pred_label_pearson": val_stats["pred_label_pearson"],
                     "val_rank_accuracy": val_stats["rank_accuracy"],
+                    "val_bin_mae_mean": val_stats["bin_mae_mean"],
+                    "val_bin_mae_max": val_stats["bin_mae_max"],
+                    "val_max_abs_bin_bias": val_stats["max_abs_bin_bias"],
+                    "val_high_speed_mae": val_stats["high_speed_mae"],
                     "val_aux_v_mae": val_stats["aux_v_mae"],
                     "val_aux_v_std": val_stats["aux_v_std"],
                     "val_aux_v_min": val_stats["aux_v_min"],
@@ -1226,6 +1600,8 @@ def train_cross_env():
                 f"final_mape={val_stats['mape']:.2f}%, final_std={val_stats['pred_std']:.6f}, "
                 f"final_range=[{val_stats['pred_min']:.6f}, {val_stats['pred_max']:.6f}], "
                 f"final_corr={val_stats['pred_label_pearson']:.6f}, final_rank={val_stats['rank_accuracy']:.6f}, "
+                f"bin_mae_max={val_stats['bin_mae_max']:.6f}, max_bin_bias={val_stats['max_abs_bin_bias']:.6f}, "
+                f"high_speed_mae={val_stats['high_speed_mae']:.6f}, "
                 f"aux_mae={val_stats['aux_v_mae']:.6f}, aux_std={val_stats['aux_v_std']:.6f}, "
                 f"aux_range=[{val_stats['aux_v_min']:.6f}, {val_stats['aux_v_max']:.6f}], "
                 f"log_tau=[{val_stats['log_tau_pred_min']:.6f}, {val_stats['log_tau_pred_max']:.6f}], "
@@ -1243,8 +1619,14 @@ def train_cross_env():
                     "loss": val_stats["loss"],
                     "pred_std": val_stats["pred_std"],
                     "rank_accuracy": val_stats["rank_accuracy"],
+                    "bin_mae_max": val_stats["bin_mae_max"],
+                    "max_abs_bin_bias": val_stats["max_abs_bin_bias"],
+                    "high_speed_mae": val_stats["high_speed_mae"],
                 }
+                best_per_velocity_rows = val_stats["per_velocity"]
+                best_raw_dependency = val_stats["raw_dependency"]
                 best_epoch = epoch
+                save_validation_predictions_csv(best_val_predictions_path, val_stats)
                 torch.save(
                     {
                         "model_state_dict": model.state_dict(),
@@ -1258,6 +1640,12 @@ def train_cross_env():
                         "val_pred_max": val_stats["pred_max"],
                         "val_pred_label_pearson": val_stats["pred_label_pearson"],
                         "val_rank_accuracy": val_stats["rank_accuracy"],
+                        "val_bin_mae_mean": val_stats["bin_mae_mean"],
+                        "val_bin_mae_max": val_stats["bin_mae_max"],
+                        "val_max_abs_bin_bias": val_stats["max_abs_bin_bias"],
+                        "val_high_speed_mae": val_stats["high_speed_mae"],
+                        "val_per_velocity": val_stats["per_velocity"],
+                        "val_raw_dependency": val_stats["raw_dependency"],
                         "val_aux_v_mae": val_stats["aux_v_mae"],
                         "val_aux_v_std": val_stats["aux_v_std"],
                         "val_aux_v_min": val_stats["aux_v_min"],
@@ -1300,6 +1688,7 @@ def train_cross_env():
                 "best_val_mae": best_val_mae,
                 "model_weights_path": model_weights_path,
                 "loss_curve_path": loss_curve_path,
+                "best_val_predictions_path": best_val_predictions_path,
                 "window_ms": window_ms,
                 "base_dt_us": base_dt_us,
                 "base_total_steps": base_total_steps,
@@ -1308,7 +1697,9 @@ def train_cross_env():
                 "snn_step_us": snn_step_us,
                 "snn_steps": snn_steps,
                 "snn_input_scale_mode": snn_input_scale_mode,
+                "requested_batch_size": requested_batch_size,
                 "batch_size": batch_size,
+                "oom_fallback_used": oom_fallback_used,
                 "epochs": epochs,
                 "dt_us": dt_us,
                 "num_workers": num_workers,
@@ -1339,6 +1730,8 @@ def train_cross_env():
                 "train_ds": train_ds,
                 "val_ds": val_ds,
                 "smoke_test": smoke_test_stats,
+                "best_per_velocity": best_per_velocity_rows,
+                "best_raw_dependency": best_raw_dependency,
             }
             write_training_report(report_path, run_info, epoch_records)
     except KeyboardInterrupt:
@@ -1369,6 +1762,7 @@ def train_cross_env():
         "best_val_mae": best_val_mae,
         "model_weights_path": model_weights_path,
         "loss_curve_path": loss_curve_path,
+        "best_val_predictions_path": best_val_predictions_path,
         "window_ms": window_ms,
         "base_dt_us": base_dt_us,
         "base_total_steps": base_total_steps,
@@ -1377,7 +1771,9 @@ def train_cross_env():
         "snn_step_us": snn_step_us,
         "snn_steps": snn_steps,
         "snn_input_scale_mode": snn_input_scale_mode,
+        "requested_batch_size": requested_batch_size,
         "batch_size": batch_size,
+        "oom_fallback_used": oom_fallback_used,
         "epochs": epochs,
         "dt_us": dt_us,
         "num_workers": num_workers,
@@ -1408,6 +1804,8 @@ def train_cross_env():
         "train_ds": train_ds,
         "val_ds": val_ds,
         "smoke_test": smoke_test_stats,
+        "best_per_velocity": best_per_velocity_rows,
+        "best_raw_dependency": best_raw_dependency,
     }
     write_training_report(report_path, run_info, epoch_records)
 
