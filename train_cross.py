@@ -36,13 +36,12 @@ from model import SNN_CNN_Hybrid
 
 
 LOSS_COMPONENT_KEYS = [
-    "velocity_loss",
-    "tau_velocity_loss",
+    "final_velocity_loss",
     "tau_log_loss",
     "rank_loss",
-    "pred_var_loss",
+    "final_var_loss",
+    "v_aux_loss",
     "tau_delta_reg_loss",
-    "optional_map_smooth_loss",
 ]
 
 
@@ -144,32 +143,30 @@ def total_variation_loss(x):
 
 
 def compute_training_loss(model_output, d_values, y_true, loss_weights):
-    v_pred = model_output["v_pred"]
+    v_pred_aux = model_output.get("v_pred")
     tau_pred = model_output["tau_pred"]
     log_tau_pred = model_output["log_tau_pred"]
     log_tau_delta = model_output.get("log_tau_delta")
 
     tau_target = d_values / torch.clamp(y_true, min=1e-8)
     log_tau_target = torch.log(torch.clamp(tau_target, min=1e-8))
-    v_from_tau = d_values / torch.clamp(tau_pred, min=1e-8)
+    v_final = d_values / torch.clamp(tau_pred, min=1e-8)
 
-    loss_velocity = F.smooth_l1_loss(v_pred, y_true)
-    loss_tau_velocity = F.smooth_l1_loss(v_from_tau, y_true)
+    loss_final_velocity = F.smooth_l1_loss(v_final, y_true)
     loss_tau_log = F.smooth_l1_loss(log_tau_pred, log_tau_target)
-    loss_rank = pairwise_ranking_loss(v_pred, y_true, margin=loss_weights["rank_margin"])
-    pred_std = v_pred.std(unbiased=False)
+    loss_rank = pairwise_ranking_loss(v_final, y_true, margin=loss_weights["rank_margin"])
+    final_std = v_final.std(unbiased=False)
     target_std = y_true.std(unbiased=False)
-    loss_pred_var = F.relu(loss_weights["pred_std_fraction"] * target_std - pred_std)
+    loss_final_var = F.relu(loss_weights["pred_std_fraction"] * target_std - final_std)
+    if v_pred_aux is None:
+        loss_v_aux = y_true.new_tensor(0.0)
+    else:
+        loss_v_aux = F.smooth_l1_loss(v_pred_aux, y_true)
 
     if log_tau_delta is None:
         loss_tau_delta_reg = y_true.new_tensor(0.0)
     else:
         loss_tau_delta_reg = log_tau_delta.pow(2).mean()
-
-    if loss_weights.get("optional_map_smooth", 0.0) > 0.0 and "fused_map" in model_output:
-        loss_optional_map_smooth = total_variation_loss(model_output["fused_map"])
-    else:
-        loss_optional_map_smooth = y_true.new_tensor(0.0)
 
     def weighted(key, value):
         weight = loss_weights.get(key, 0.0)
@@ -178,24 +175,22 @@ def compute_training_loss(model_output, d_values, y_true, loss_weights):
         return weight * value
 
     total_loss = (
-        weighted("velocity", loss_velocity)
-        + weighted("tau_velocity", loss_tau_velocity)
+        weighted("final_velocity", loss_final_velocity)
         + weighted("tau_log", loss_tau_log)
         + weighted("rank", loss_rank)
-        + weighted("pred_var", loss_pred_var)
+        + weighted("final_var", loss_final_var)
+        + weighted("v_aux", loss_v_aux)
         + weighted("tau_delta_reg", loss_tau_delta_reg)
-        + weighted("optional_map_smooth", loss_optional_map_smooth)
     )
 
     return total_loss, {
-        "velocity_loss": loss_velocity,
-        "tau_velocity_loss": loss_tau_velocity,
+        "final_velocity_loss": loss_final_velocity,
         "tau_log_loss": loss_tau_log,
         "rank_loss": loss_rank,
-        "pred_var_loss": loss_pred_var,
+        "final_var_loss": loss_final_var,
+        "v_aux_loss": loss_v_aux,
         "tau_delta_reg_loss": loss_tau_delta_reg,
-        "optional_map_smooth_loss": loss_optional_map_smooth,
-    }, v_from_tau
+    }, v_final
 
 
 def format_duration(elapsed_seconds):
@@ -408,8 +403,8 @@ def write_training_report(report_path, run_info, epoch_records):
         f"- Duration: `{format_duration(run_info['elapsed'])}`",
         f"- Best epoch: `{run_info['best_epoch']}`",
         f"- Best validation loss: `{run_info['best_val_loss']:.6f}`" if run_info["best_epoch"] >= 0 else "- Best validation loss: `N/A`",
-        f"- Best validation MAE: `{run_info['best_val_mae']:.6f}`" if run_info["best_epoch"] >= 0 else "- Best validation MAE: `N/A`",
-        "- Best checkpoint tie-breakers: `val_mae`, `val_rank_accuracy`, `val_pred_std`, `val_loss`",
+        f"- Best validation final MAE: `{run_info['best_val_mae']:.6f}`" if run_info["best_epoch"] >= 0 else "- Best validation final MAE: `N/A`",
+        "- Best checkpoint tie-breakers: `val_final_mae`, `final_rank_accuracy`, `final_pred_std`, `val_loss`",
         f"- Model weights path: `{run_info['model_weights_path']}`",
         f"- Loss curve path: `{run_info['loss_curve_path']}`",
         "",
@@ -539,11 +534,11 @@ def write_training_report(report_path, run_info, epoch_records):
 
     epoch_columns = [
         "Epoch", "Stage", "LR", "Train Batches", "Val Batches", "Train Samples", "Val Samples",
-        "Train Loss", "Train Velocity Loss", "Train Tau Velocity Loss", "Train Tau Log Loss",
-        "Train Rank Loss", "Train Pred Var Loss",
-        "Val Loss", "Val MAE", "Val RMSE", "Val MAPE", "Pred Std", "Pred Range",
-        "Pred/Label Pearson", "Rank Acc",
-        "Tau Pred MAE", "Tau Pred Std", "Tau Pred Range", "Tau Sample Range", "Log Tau Pred Range",
+        "Train Loss", "Train Final Velocity Loss", "Train Tau Log Loss",
+        "Train Rank Loss", "Train Final Var Loss", "Train Aux V Loss",
+        "Val Loss", "Val Final MAE", "Val Final RMSE", "Val Final MAPE", "Final Pred Std", "Final Pred Range",
+        "Final Pred/Label Pearson", "Final Rank Acc",
+        "Aux V MAE", "Aux V Std", "Aux V Range", "Tau Sample Range", "Log Tau Pred Range",
         "Feat1 Mean", "Feat1 Std", "Feat2 Mean", "Feat2 Std", "Feat3 Mean", "Feat3 Std",
         "CNN Embedding Std", "Layer1 Spike Rate", "Layer2 Spike Rate", "Layer3 Spike Rate",
     ]
@@ -566,15 +561,16 @@ def write_training_report(report_path, run_info, epoch_records):
                 f"{record['val_batches_processed']}/{record['val_batches_available']} | "
                 f"{record['train_samples_seen']}/{record['train_samples_available']} | "
                 f"{record['val_samples_seen']}/{record['val_samples_available']} | "
-                f"{record['train_loss']:.6f} | {record['train_velocity_loss']:.6f} | "
-                f"{record['train_tau_velocity_loss']:.6f} | {record['train_tau_log_loss']:.6f} | "
-                f"{record['train_rank_loss']:.6f} | {record['train_pred_var_loss']:.6f} | "
+                f"{record['train_loss']:.6f} | {record['train_final_velocity_loss']:.6f} | "
+                f"{record['train_tau_log_loss']:.6f} | "
+                f"{record['train_rank_loss']:.6f} | {record['train_final_var_loss']:.6f} | "
+                f"{record['train_v_aux_loss']:.6f} | "
                 f"{record['val_loss']:.6f} | {record['val_mae']:.6f} | {record['val_rmse']:.6f} | "
                 f"{record['val_mape']:.2f}% | {record['val_pred_std']:.6f} | "
                 f"{record['val_pred_min']:.6f}-{record['val_pred_max']:.6f} | "
                 f"{record['val_pred_label_pearson']:.6f} | {record['val_rank_accuracy']:.6f} | "
-                f"{record['val_tau_pred_mae']:.6f} | {record['val_tau_pred_std']:.6f} | "
-                f"{record['val_tau_pred_min']:.6f}-{record['val_tau_pred_max']:.6f} | "
+                f"{record['val_aux_v_mae']:.6f} | {record['val_aux_v_std']:.6f} | "
+                f"{record['val_aux_v_min']:.6f}-{record['val_aux_v_max']:.6f} | "
                 f"{record['val_tau_sample_min']:.6e}-{record['val_tau_sample_max']:.6e} | "
                 f"{record['val_log_tau_pred_min']:.6f}-{record['val_log_tau_pred_max']:.6f} | "
                 f"{record['val_feat_1_mean']:.6e} | {record['val_feat_1_std']:.6e} | "
@@ -590,8 +586,8 @@ def write_training_report(report_path, run_info, epoch_records):
             "",
             "## Notes",
             "",
-            "- Final prediction is `v_pred` from clean serial Legacy-SNN -> CNN backbone.",
-            "- Tau metrics use `d / tau_pred` as a physically constrained auxiliary prediction.",
+            "- Final prediction is `d_values / tau_pred` from the sample-level tau head.",
+            "- `v_pred` is auxiliary only and is not used for checkpoint selection.",
             "- No raw direct head, no teacher distillation, no fusion, no beta, no patch tau map.",
             "- Dataset keeps 20us base bins; each SNN step is a sqrt-scaled aggregate of 40 base bins.",
             "- SNN feature diagnostics report accumulated post-SNN feature maps before CNN decoding.",
@@ -652,8 +648,8 @@ def run_epoch(
     feature_diag_batches = 0
 
     all_v_true = []
-    all_v_pred = []
-    all_v_from_tau = []
+    all_v_final = []
+    all_v_aux = []
     all_tau_pred = []
     all_log_tau_pred = []
 
@@ -694,7 +690,7 @@ def run_epoch(
                 snn_input_scale_mode=snn_input_scale_mode,
                 base_dt_us=base_dt_us,
             )
-            loss, component_losses, v_from_tau = compute_training_loss(
+            loss, component_losses, v_final = compute_training_loss(
                 model_output,
                 d_values,
                 y_true,
@@ -712,20 +708,20 @@ def run_epoch(
                 component_loss_sums[key] += float(value.item())
             feature_diag_batches = _append_feature_diagnostics(model_output, feature_diag_sums, feature_diag_batches)
 
-            v_pred = model_output["v_pred"]
+            v_pred_aux = model_output["v_pred"]
             all_v_true.extend(y_true.detach().cpu().numpy().tolist())
-            all_v_pred.extend(v_pred.detach().cpu().numpy().tolist())
-            all_v_from_tau.extend(v_from_tau.detach().cpu().numpy().tolist())
+            all_v_final.extend(v_final.detach().cpu().numpy().tolist())
+            all_v_aux.extend(v_pred_aux.detach().cpu().numpy().tolist())
             all_tau_pred.extend(model_output["tau_pred"].detach().cpu().numpy().tolist())
             all_log_tau_pred.extend(model_output["log_tau_pred"].detach().cpu().numpy().tolist())
 
-            v_batch = v_pred.detach().cpu()
-            tau_batch = v_from_tau.detach().cpu()
+            v_batch = v_final.detach().cpu()
+            aux_batch = v_pred_aux.detach().cpu()
             progress_bar.set_postfix(
                 loss=f"{loss.item():.4f}",
-                v=f"{v_batch.min().item():.3f}-{v_batch.max().item():.3f}",
-                v_std=f"{v_batch.std(unbiased=False).item():.3e}",
-                tau_v=f"{tau_batch.min().item():.3f}-{tau_batch.max().item():.3f}",
+                final=f"{v_batch.min().item():.3f}-{v_batch.max().item():.3f}",
+                final_std=f"{v_batch.std(unbiased=False).item():.3e}",
+                aux=f"{aux_batch.min().item():.3f}-{aux_batch.max().item():.3f}",
                 feat3=f"{model_output['snn_feat_3'].detach().mean().item():.2e}",
             )
 
@@ -741,25 +737,23 @@ def run_epoch(
         for key, value in feature_diag_sums.items()
     }
 
-    mae, rmse, mape = compute_scalar_metrics(all_v_true, all_v_pred)
-    tau_mae, tau_rmse, tau_mape = compute_scalar_metrics(all_v_true, all_v_from_tau)
+    mae, rmse, mape = compute_scalar_metrics(all_v_true, all_v_final)
+    aux_mae, aux_rmse, aux_mape = compute_scalar_metrics(all_v_true, all_v_aux)
     v_true_arr = np.asarray(all_v_true, dtype=np.float64)
-    v_pred_arr = np.asarray(all_v_pred, dtype=np.float64)
-    v_tau_arr = np.asarray(all_v_from_tau, dtype=np.float64)
+    v_final_arr = np.asarray(all_v_final, dtype=np.float64)
+    v_aux_arr = np.asarray(all_v_aux, dtype=np.float64)
     tau_pred_arr = np.asarray(all_tau_pred, dtype=np.float64)
     log_tau_arr = np.asarray(all_log_tau_pred, dtype=np.float64)
 
-    pred_std = float(v_pred_arr.std()) if v_pred_arr.size else float("nan")
-    pred_min = float(v_pred_arr.min()) if v_pred_arr.size else float("nan")
-    pred_max = float(v_pred_arr.max()) if v_pred_arr.size else float("nan")
-    pred_label_pearson = safe_pearson(v_pred_arr, v_true_arr)
-    rank_accuracy = pairwise_rank_accuracy(v_pred_arr, v_true_arr)
-
-    tau_pred_std = float(v_tau_arr.std()) if v_tau_arr.size else float("nan")
-    tau_pred_min = float(v_tau_arr.min()) if v_tau_arr.size else float("nan")
-    tau_pred_max = float(v_tau_arr.max()) if v_tau_arr.size else float("nan")
-    tau_pred_label_pearson = safe_pearson(v_tau_arr, v_true_arr)
-    tau_rank_accuracy = pairwise_rank_accuracy(v_tau_arr, v_true_arr)
+    pred_std = float(v_final_arr.std()) if v_final_arr.size else float("nan")
+    pred_min = float(v_final_arr.min()) if v_final_arr.size else float("nan")
+    pred_max = float(v_final_arr.max()) if v_final_arr.size else float("nan")
+    pred_label_pearson = safe_pearson(v_final_arr, v_true_arr)
+    rank_accuracy = pairwise_rank_accuracy(v_final_arr, v_true_arr)
+    aux_pred_std = float(v_aux_arr.std()) if v_aux_arr.size else float("nan")
+    aux_pred_min = float(v_aux_arr.min()) if v_aux_arr.size else float("nan")
+    aux_pred_max = float(v_aux_arr.max()) if v_aux_arr.size else float("nan")
+    aux_pred_label_pearson = safe_pearson(v_aux_arr, v_true_arr)
     tau_sample_min = float(tau_pred_arr.min()) if tau_pred_arr.size else float("nan")
     tau_sample_max = float(tau_pred_arr.max()) if tau_pred_arr.size else float("nan")
     log_tau_min = float(log_tau_arr.min()) if log_tau_arr.size else float("nan")
@@ -776,14 +770,13 @@ def run_epoch(
         "pred_max": pred_max,
         "pred_label_pearson": pred_label_pearson,
         "rank_accuracy": rank_accuracy,
-        "tau_pred_mae": tau_mae,
-        "tau_pred_rmse": tau_rmse,
-        "tau_pred_mape": tau_mape,
-        "tau_pred_std": tau_pred_std,
-        "tau_pred_min": tau_pred_min,
-        "tau_pred_max": tau_pred_max,
-        "tau_pred_label_pearson": tau_pred_label_pearson,
-        "tau_rank_accuracy": tau_rank_accuracy,
+        "aux_v_mae": aux_mae,
+        "aux_v_rmse": aux_rmse,
+        "aux_v_mape": aux_mape,
+        "aux_v_std": aux_pred_std,
+        "aux_v_min": aux_pred_min,
+        "aux_v_max": aux_pred_max,
+        "aux_v_label_pearson": aux_pred_label_pearson,
         "tau_sample_min": tau_sample_min,
         "tau_sample_max": tau_sample_max,
         "log_tau_pred_min": log_tau_min,
@@ -794,7 +787,8 @@ def run_epoch(
         "num_samples": len(all_v_true),
         "available_samples": len(data_loader.dataset),
         "v_true": all_v_true,
-        "v_pred": all_v_pred,
+        "v_pred": all_v_final,
+        "v_aux": all_v_aux,
     }
 
 
@@ -888,7 +882,7 @@ def train_cross_env():
     patch_shape = (50, 46)
     dt_us = base_dt_us
     max_velocity = 2.0
-    max_train_batches = 60
+    max_train_batches = 120
     max_val_batches = None
     event_norm_mode = "source_scale"
     event_norm_clip = (0.25, 4.0)
@@ -898,7 +892,7 @@ def train_cross_env():
     scheduler_name = "ReduceLROnPlateau"
     scheduler_mode = "min"
     scheduler_factor = 0.5
-    scheduler_patience = 4
+    scheduler_patience = 5
     gradient_clip_max_norm = 1.0
     if base_total_steps != 10000 or snn_steps != 250 or snn_step_us != 800:
         raise ValueError("Input config must be 200ms, 20us base dt, K=40, 250 SNN steps.")
@@ -906,21 +900,32 @@ def train_cross_env():
         raise ValueError("base_total_steps/base_block_size/snn_bin_size must divide cleanly.")
 
     main_loss_weights = {
-        "velocity": 1.0,
-        "tau_velocity": 0.5,
-        "tau_log": 0.5,
+        "final_velocity": 1.0,
+        "tau_log": 0.75,
         "rank": 0.5,
-        "pred_var": 1.0,
+        "final_var": 0.5,
+        "v_aux": 0.1,
         "tau_delta_reg": 0.001,
-        "optional_map_smooth": 0.0,
         "rank_margin": 0.12,
         "pred_std_fraction": 0.8,
     }
     stage_schedule = [
         {
-            "name": "stage1_main",
-            "epochs": 30,
+            "name": "stage1_warm",
+            "epochs": 8,
             "lr": 1e-4,
+            "loss_weights": main_loss_weights,
+        },
+        {
+            "name": "stage2_stable",
+            "epochs": 20,
+            "lr": 5e-5,
+            "loss_weights": main_loss_weights,
+        },
+        {
+            "name": "stage3_finetune",
+            "epochs": 12,
+            "lr": 2e-5,
             "loss_weights": main_loss_weights,
         },
     ]
@@ -1179,11 +1184,11 @@ def train_cross_env():
                     "val_samples_seen": val_stats["num_samples"],
                     "val_samples_available": val_stats["available_samples"],
                     "train_loss": train_stats["loss"],
-                    "train_velocity_loss": train_stats["velocity_loss"],
-                    "train_tau_velocity_loss": train_stats["tau_velocity_loss"],
+                    "train_final_velocity_loss": train_stats["final_velocity_loss"],
                     "train_tau_log_loss": train_stats["tau_log_loss"],
                     "train_rank_loss": train_stats["rank_loss"],
-                    "train_pred_var_loss": train_stats["pred_var_loss"],
+                    "train_final_var_loss": train_stats["final_var_loss"],
+                    "train_v_aux_loss": train_stats["v_aux_loss"],
                     "val_loss": val_stats["loss"],
                     "val_mae": val_stats["mae"],
                     "val_rmse": val_stats["rmse"],
@@ -1193,10 +1198,10 @@ def train_cross_env():
                     "val_pred_max": val_stats["pred_max"],
                     "val_pred_label_pearson": val_stats["pred_label_pearson"],
                     "val_rank_accuracy": val_stats["rank_accuracy"],
-                    "val_tau_pred_mae": val_stats["tau_pred_mae"],
-                    "val_tau_pred_std": val_stats["tau_pred_std"],
-                    "val_tau_pred_min": val_stats["tau_pred_min"],
-                    "val_tau_pred_max": val_stats["tau_pred_max"],
+                    "val_aux_v_mae": val_stats["aux_v_mae"],
+                    "val_aux_v_std": val_stats["aux_v_std"],
+                    "val_aux_v_min": val_stats["aux_v_min"],
+                    "val_aux_v_max": val_stats["aux_v_max"],
                     "val_tau_sample_min": val_stats["tau_sample_min"],
                     "val_tau_sample_max": val_stats["tau_sample_max"],
                     "val_log_tau_pred_min": val_stats["log_tau_pred_min"],
@@ -1217,12 +1222,12 @@ def train_cross_env():
             print(
                 f"Epoch {epoch} summary | "
                 f"train_loss={train_stats['loss']:.6f}, val_loss={val_stats['loss']:.6f}, "
-                f"val_mae={val_stats['mae']:.6f}, val_rmse={val_stats['rmse']:.6f}, "
-                f"val_mape={val_stats['mape']:.2f}%, pred_std={val_stats['pred_std']:.6f}, "
-                f"pred_range=[{val_stats['pred_min']:.6f}, {val_stats['pred_max']:.6f}], "
-                f"pred_corr={val_stats['pred_label_pearson']:.6f}, rank_acc={val_stats['rank_accuracy']:.6f}, "
-                f"tau_mae={val_stats['tau_pred_mae']:.6f}, tau_std={val_stats['tau_pred_std']:.6f}, "
-                f"tau_range=[{val_stats['tau_pred_min']:.6f}, {val_stats['tau_pred_max']:.6f}], "
+                f"final_mae={val_stats['mae']:.6f}, final_rmse={val_stats['rmse']:.6f}, "
+                f"final_mape={val_stats['mape']:.2f}%, final_std={val_stats['pred_std']:.6f}, "
+                f"final_range=[{val_stats['pred_min']:.6f}, {val_stats['pred_max']:.6f}], "
+                f"final_corr={val_stats['pred_label_pearson']:.6f}, final_rank={val_stats['rank_accuracy']:.6f}, "
+                f"aux_mae={val_stats['aux_v_mae']:.6f}, aux_std={val_stats['aux_v_std']:.6f}, "
+                f"aux_range=[{val_stats['aux_v_min']:.6f}, {val_stats['aux_v_max']:.6f}], "
                 f"log_tau=[{val_stats['log_tau_pred_min']:.6f}, {val_stats['log_tau_pred_max']:.6f}], "
                 f"spike_rates=[{val_stats['layer1_spike_rate']:.3e}, {val_stats['layer2_spike_rate']:.3e}, "
                 f"{val_stats['layer3_spike_rate']:.3e}], "
@@ -1253,10 +1258,12 @@ def train_cross_env():
                         "val_pred_max": val_stats["pred_max"],
                         "val_pred_label_pearson": val_stats["pred_label_pearson"],
                         "val_rank_accuracy": val_stats["rank_accuracy"],
-                        "val_tau_pred_mae": val_stats["tau_pred_mae"],
-                        "val_tau_pred_std": val_stats["tau_pred_std"],
-                        "val_tau_pred_min": val_stats["tau_pred_min"],
-                        "val_tau_pred_max": val_stats["tau_pred_max"],
+                        "val_aux_v_mae": val_stats["aux_v_mae"],
+                        "val_aux_v_std": val_stats["aux_v_std"],
+                        "val_aux_v_min": val_stats["aux_v_min"],
+                        "val_aux_v_max": val_stats["aux_v_max"],
+                        "val_tau_sample_min": val_stats["tau_sample_min"],
+                        "val_tau_sample_max": val_stats["tau_sample_max"],
                         "val_log_tau_pred_min": val_stats["log_tau_pred_min"],
                         "val_log_tau_pred_max": val_stats["log_tau_pred_max"],
                         "stage_schedule": stage_schedule,
